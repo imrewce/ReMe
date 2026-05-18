@@ -96,6 +96,30 @@ jobs:
     steps:
       - backend: search_step
 
+  - backend: base
+    name: read
+    description: "read a markdown file (absolute path; relative path resolved under .reme)"
+    parameters:
+      type: object
+      properties:
+        path:
+          type: string
+          description: "absolute or relative path; relative is rooted at the reme working_dir (.reme); markdown only (.md auto-appended when no suffix)"
+        start_line:
+          type: integer
+          description: "first line to read (1-based, inclusive)"
+        end_line:
+          type: integer
+          description: "last line to read (1-based, inclusive)"
+        max_bytes:
+          type: integer
+          description: "max bytes returned before byte-level truncation"
+          default: 51200
+      required:
+        - path
+    steps:
+      - backend: read_step
+
   - backend: stream
     name: stream_demo
     description: "stream demo job: repeat query 10x and stream char-by-char"
