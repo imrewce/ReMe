@@ -11,6 +11,26 @@ from ...utils import get_logger
 logger = get_logger()
 
 
+def resolve_path(working_path: Path, raw: str) -> tuple[Path | None, str | None]:
+    """Resolve a relative `path=` argument under self.working_path.
+
+    Rules:
+        - the caller supplies the full relative path under ``self.working_path``;
+        absolute paths are rejected.
+    Returns ``(abs_path, None)`` on success, or ``(None, error_message)`` on failure.
+    Filetype-specific gating (e.g. markdown-only / suffix auto-append) is
+    layered on top by callers — see ``reme4/steps/crud/_file_io.py::gate_md``.
+    """
+    if not raw or not str(raw).strip():
+        return None, "`path` is required"
+    s = str(raw).strip()
+    p = Path(s)
+    if p.is_absolute():
+        logger.info("absolute path detected, recommmending relative paths")
+        return p, None
+    return working_path / p, None
+
+
 def gate_md(target: Path, raw: str) -> tuple[Path | None, str | None]:
     """Markdown-only gate: auto-append `.md` when no suffix; reject any non-`.md` suffix.
 

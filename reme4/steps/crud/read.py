@@ -2,6 +2,7 @@
 
 from ._file_io import (
     gate_md,
+    resolve_path,
     read_file_safe,
     truncate_text_output,
 )
@@ -26,7 +27,7 @@ class ReadStep(BaseStep):
         start_line = self.context.get("start_line")
         end_line = self.context.get("end_line")
 
-        target, err = self.resolve_path(raw)
+        target, err = resolve_path(self.working_path, raw)
         if err:
             self._fail(err)
             return None
