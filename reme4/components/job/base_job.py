@@ -50,5 +50,4 @@ class BaseJob(BaseComponent):
         except Exception as e:
             self.logger.exception(f"Failed to execute job: {e}")
             context.response.answer = str(e)
-            context.response.success = False
         return context.response
