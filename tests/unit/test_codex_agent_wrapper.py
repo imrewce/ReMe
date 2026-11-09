@@ -38,8 +38,10 @@ from reme.components.service.scoped_mcp import ScopedMCP
 from reme.config import resolve_app_config
 from reme.enumeration import ChunkEnum, ComponentEnum
 from reme.schema import Response, TokenUsage
-from reme.steps.proactive.pa import PaChatStep, PaNewSessionStep
+from reme.steps.proactive.pa_chat import PaChatStep, PaNewSessionStep
+from reme.steps.proactive.temp_proactive import TempProactiveStep
 from reme.utils import global_counter_get_all
+from .pa_helpers import bind_pa
 
 
 class _Job:
@@ -147,7 +149,7 @@ class _Thread:
         self.busy = True
         return _Turn(self, inputs)
 
-    async def read(self):
+    async def read(self, **_kwargs):
         return SimpleNamespace(
             thread=SimpleNamespace(
                 status=SimpleNamespace(root=SimpleNamespace(type="active" if self.busy else "idle")),
@@ -224,8 +226,8 @@ class _Codex:
         self.opened.append(("resume", thread_id, options))
         return self.threads[thread_id]
 
-    async def thread_read(self, thread_id):
-        return await self.threads[thread_id].read()
+    async def thread_read(self, thread_id, **kwargs):
+        return await self.threads[thread_id].read(**kwargs)
 
     async def thread_fork(self, thread_id, **options):
         forked = await self.thread_start(**options)
@@ -269,6 +271,28 @@ async def system(tmp_path, monkeypatch):
         await first.close()
         await second.close()
         await server.close()
+
+
+@pytest.mark.asyncio
+async def test_session_listener_observes_native_activity_and_disconnect_without_a_turn(system):
+    first, _second, server, _job = system
+    session_id = await first.create_session(job_tools=[])
+    notifications = []
+    unsubscribe = server.watch_session(session_id, notifications.append)
+    native = _Codex.instances[0]
+    native.notify_status(session_id, "active")
+    native.notify_status(session_id, "notLoaded")
+    async with asyncio.timeout(1):
+        while len(notifications) < 2:
+            await asyncio.sleep(0)
+    assert [status.status for status in notifications] == ["active", "not_loaded"]
+    native.notifications.put_nowait(ConnectionError("upstream disconnected"))
+    async with asyncio.timeout(1):
+        while notifications[-1] is not None:
+            await asyncio.sleep(0)
+    assert server._failed
+    unsubscribe()
+    assert session_id not in server._session_listeners
 
 
 def _usage_event(last, total, *, turn_id="turn-2", estimate=None):
@@ -342,12 +366,21 @@ async def test_releasing_a_superseded_empty_session_keeps_other_threads(system):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("language", ["en", "zh"])
-async def test_pa_memory_path_reaches_codex_without_snapshotting_contents(system, language):
+async def test_pa_memory_path_reaches_codex_without_snapshotting_contents(system, language, monkeypatch):
+    from datetime import datetime
+
+    monkeypatch.setattr(
+        "reme.steps.proactive.base_pa_step.BasePaStep._now",
+        lambda _self: datetime.fromisoformat("2026-11-08T12:00:00+08:00"),
+    )
     agent, _, _, _ = system
     context = agent.app_context
     context.app_config.language = language
+    from .pa_helpers import bind_pa
+
+    bind_pa(context, agent)
     context.components["agent_wrapper"] = {"default": agent}
-    memory = agent.workspace_path / "digest/personal/REME_MEMORY.md"
+    memory = agent.workspace_path / "daily/personal/MEMORY.md"
     memory.parent.mkdir(parents=True)
     memory.write_text("# Preferences\n- Use Chinese.\n", encoding="utf-8")
     session_id = (await PaNewSessionStep(app_context=context)()).answer
@@ -355,11 +388,9 @@ async def test_pa_memory_path_reaches_codex_without_snapshotting_contents(system
     prompt = client.opened[-1][2]["developer_instructions"]
     assert str(memory) in prompt and str(agent.workspace_path) in prompt
     assert "Use Chinese." not in prompt
-    assert ("先读取最新完整文件" if language == "zh" else "Read the complete current file") in prompt
-    assert ("立即删除对应记忆" if language == "zh" else "Immediately remove memories") in prompt
-    assert (
-        "不从旧会话或摘要中恢复" if language == "zh" else "restore them from old conversations or summaries"
-    ) in prompt
+    assert ("读最新完整记忆" if language == "zh" else "Read the complete latest file") in prompt
+    assert ("要求遗忘时立即删除" if language == "zh" else "Remove requested memories immediately") in prompt
+    assert ("不转存，也不从旧对话或摘要恢复" if language == "zh" else "restoring them from old history") in prompt
     assert not client.threads[session_id].inputs
     memory.write_text("# Preferences\n- Use English.\n", encoding="utf-8")
     for _ in range(2):
@@ -697,6 +728,178 @@ async def test_loaded_thread_constraints_cannot_be_changed_by_another_wrapper(sy
         await second.reply("two", session_id=thread_id, **{**binding, **changes})
     assert token in server.jobs_mcp.scopes
     await second.reply("three", session_id=thread_id, **binding)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restore", ["loaded", "unloaded", "restart"])
+async def test_fork_inherits_source_instructions_tools_and_turn_settings(system, restore):
+    from openai_codex import Sandbox
+    from openai_codex.types import ReasoningEffort
+
+    first, second, server, job = system
+    original = await first.reply(
+        "source work",
+        system_prompt="Original instructions.",
+        model="original-model",
+        effort="high",
+        sandbox="read-only",
+        personality="friendly",
+        job_tools=[job.name],
+        injected_job_kwargs={"_allowed_paths": ["original.md"]},
+        config={"mcp_servers": {"external": {"url": "https://example.test/mcp"}}},
+    )
+    source_id = original["session_id"]
+    source_token = server._threads[source_id].token
+    source_tools = server.jobs_mcp.scopes[source_token]
+    settings_path = server._message_path(source_id).with_suffix(".config.jsonl")
+    assert source_token not in settings_path.read_text()
+    native = _Codex.instances[0]
+    if restore != "loaded":
+        native.loaded.clear()
+    if restore == "restart":
+        server._threads.clear()
+        server.jobs_mcp.scopes.clear()
+    second.kwargs.update(system_prompt="Other instructions.", model="other-model", effort="low", job_tools=[])
+
+    forked = await second.reply("Only summarize.", resume=source_id, fork_session=True)
+
+    assert forked["session_id"] != source_id and native.threads[source_id].inputs == ["source work"]
+    assert native.threads[forked["session_id"]].inputs == ["Only summarize."]
+    operation, parent, options = native.opened[-1]
+    assert operation == "fork" and parent == source_id
+    assert options["developer_instructions"] == "Original instructions."
+    assert options["model"] == "original-model" and options["sandbox"] == Sandbox.read_only
+    assert options["config"]["personality"] == "friendly"
+    assert options["config"]["mcp_servers"]["external"]["url"] == "https://example.test/mcp"
+    fork_token = server._threads[forked["session_id"]].token
+    assert fork_token != source_token
+    tools = server.jobs_mcp.scopes[fork_token]
+    assert [(tool.name, tool.description, tool.parameters) for tool in tools] == [
+        (tool.name, tool.description, tool.parameters) for tool in source_tools
+    ]
+    await tools[0].fn(query="read")
+    assert job.calls[-1]["_allowed_paths"] == ["original.md"]
+    assert native.threads[forked["session_id"]].options[-1]["effort"] == ReasoningEffort.high
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persisted", [False, True])
+async def test_fork_of_unstarted_session_preserves_source_options_and_tools(system, monkeypatch, persisted):
+    first, second, server, job = system
+    source_id = await first.create_session(
+        system_prompt="Source instructions.",
+        model="source-model",
+        job_tools=[job.name],
+        injected_job_kwargs={"_allowed_paths": ["source.md"]},
+    )
+    native = _Codex.instances[0]
+    source = native.threads[source_id]
+    source.path = str(server.session_path / "sessions" / "source.jsonl")
+    if persisted:
+        Path(source.path).parent.mkdir(parents=True, exist_ok=True)
+        Path(source.path).write_text("", encoding="utf-8")
+    fork = AsyncMock(
+        wraps=native.thread_fork,
+        side_effect=None if persisted else RuntimeError("no rollout found for thread id"),
+    )
+    monkeypatch.setattr(native, "thread_fork", fork)
+    second.kwargs.update(system_prompt="Unrelated instructions.", model="other-model", job_tools=[])
+
+    reply = await second.reply("Prepare context.", resume=source_id, fork_session=True)
+
+    assert reply["status"] == "completed" and reply["session_id"] != source_id
+    assert source.inputs == [] and server._threads[source_id].pending is source
+    assert source_id not in native.unsubscribed
+    assert native.opened[-1][0] == ("fork" if persisted else "start")
+    assert native.opened[-1][2]["developer_instructions"] == "Source instructions."
+    assert native.opened[-1][2]["model"] == "source-model"
+    assert fork.await_count == int(persisted)
+    token = server._threads[reply["session_id"]].token
+    await server.jobs_mcp.scopes[token][0].fn(query="read")
+    assert job.calls[-1]["_allowed_paths"] == ["source.md"]
+
+
+@pytest.mark.asyncio
+async def test_temporary_preparation_uses_an_independent_empty_source_fork(system, monkeypatch):
+    first, _, server, job = system
+    runtime = bind_pa(first.app_context, first)
+    runtime._initialize_files()
+    source_id = await first.create_session(system_prompt="Source instructions.", job_tools=[job.name])
+    runtime.session_id = source_id
+    task = await runtime.temp_tasks.create("Prepare an isolated one-shot task.")
+    native = _Codex.instances[0]
+    fork = AsyncMock(side_effect=RuntimeError("no rollout found for thread id"))
+    monkeypatch.setattr(native, "thread_fork", fork)
+    step = TempProactiveStep(app_context=first.app_context)
+
+    async with asyncio.timeout(3):
+        prepared = await step._prepare(task)
+
+    assert prepared.status == "scheduled" and prepared.error is None and prepared.retry_at is None
+    assert task.query in (runtime.workspace_path / prepared.handoff_path).read_text()
+    assert runtime.session_id == source_id and native.threads[source_id].inputs == []
+    assert server._threads[source_id].pending is native.threads[source_id]
+    fork.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fork_waits_for_source_and_cancellation_preserves_its_tools(system):
+    first, second, server, _ = system
+    source_id = (await first.reply("initial", job_tools=["search"]))["session_id"]
+    token = server._threads[source_id].token
+    entered, release = asyncio.Event(), asyncio.Event()
+    native = _Codex.instances[0]
+
+    async def hold(_thread, _inputs):
+        entered.set()
+        await release.wait()
+
+    native.run_hook = hold
+    running = asyncio.create_task(first.reply("running", resume=source_id, job_tools=["search"]))
+    await asyncio.wait_for(entered.wait(), 2)
+    forked = asyncio.create_task(second.reply("handoff", resume=source_id, fork_session=True))
+    try:
+        await asyncio.sleep(0.02)
+        assert not any(operation == "fork" for operation, _, _ in native.opened)
+        forked.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await forked
+        assert token in server.jobs_mcp.scopes and len(server.jobs_mcp.scopes) == 1
+    finally:
+        release.set()
+        await running
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", ["fork failed", "no rollout found for thread id"])
+async def test_failed_fork_revokes_only_its_new_tool_scope(system, monkeypatch, error):
+    first, _, server, _ = system
+    source_id = (await first.reply("source", job_tools=["search"]))["session_id"]
+    token = server._threads[source_id].token
+    monkeypatch.setattr(_Codex.instances[0], "thread_fork", AsyncMock(side_effect=RuntimeError(error)))
+    with pytest.raises(RuntimeError, match=error):
+        await first.reply("handoff", resume=source_id, fork_session=True)
+    assert set(server.jobs_mcp.scopes) == {token}
+
+
+@pytest.mark.asyncio
+async def test_application_bound_tool_approval_preserves_native_read_only_and_external_policy(system):
+    from openai_codex import Sandbox
+
+    first, _, _, _ = system
+    external = {"url": "http://external.test/mcp", "tools": {"write": {"approval_mode": "prompt"}}}
+    await first.reply(
+        "one",
+        job_tools=["search"],
+        sandbox="read-only",
+        config={"mcp_servers": {"external": external}},
+    )
+    options = _Codex.instances[0].opened[0][2]
+    assert options["sandbox"] == Sandbox.read_only
+    servers = options["config"]["mcp_servers"]
+    assert servers["reme_jobs"]["enabled_tools"] == ["search"]
+    assert servers["reme_jobs"]["tools"] == {"search": {"approval_mode": "approve"}}
+    assert servers["external"] == external
 
 
 @pytest.mark.asyncio
@@ -1049,6 +1252,11 @@ def test_default_and_demo_configuration_use_named_shared_servers(monkeypatch):
             assert servers["default"]["base_url"] == "https://demo.invalid/v1"
         else:
             assert servers["oauth"]["codex_home"] == "~/.codex"
+            assert wrappers["codex_oauth"]["effort"] == "xhigh"
+            assert set(servers["oauth"]["config_overrides"]) == {
+                'model_reasoning_effort="xhigh"',
+                'agents.default_subagent_reasoning_effort="xhigh"',
+            }
 
 
 @pytest.mark.asyncio
@@ -1603,3 +1811,72 @@ def test_event_to_chunks_maps_approval_started_and_completed(review_status):
     assert completed_chunk.metadata["status"] == "completed"
     assert completed_chunk.metadata["review"]["status"] == review_status
     assert completed_chunk.metadata["decision_source"] == {"type": "guardian"}
+
+
+@pytest.mark.asyncio
+async def test_reply_activity_reaches_the_selected_proactive_session(system):
+    from reme.schema import AgentActivity
+
+    first, _second, server, _job = system
+    selected = await first.create_session(job_tools=[])
+    observed = []
+    unsubscribe = server.watch_session(selected, observed.append)
+    try:
+        await first.reply("background result", job_tools=[], activity_source="proactive", activity_session_id=selected)
+        activities = [event for event in observed if isinstance(event, AgentActivity)]
+        assert activities[0].phase == "thinking"
+        assert activities[-1].phase == "completed"
+        assert all(event.session_id == selected and event.source == "proactive" for event in activities)
+        assert len({event.turn_id for event in activities}) == 1
+    finally:
+        unsubscribe()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["interrupted", "failed"])
+async def test_activity_closes_when_the_consumer_stops_or_the_provider_fails(system, outcome):
+    from reme.schema import AgentActivity
+
+    first, _second, server, _job = system
+    session_id = await first.create_session(job_tools=[])
+    observed = []
+    unsubscribe = server.watch_session(session_id, observed.append)
+    try:
+        stream = first.reply_stream("test", session_id=session_id)
+        await anext(stream)
+        if outcome == "failed":
+
+            async def fail(_thread, _inputs):
+                raise ValueError("provider failed")
+
+            _Codex.instances[0].run_hook = fail
+            with pytest.raises(ValueError, match="provider failed"):
+                await anext(stream)
+        else:
+            await stream.aclose()
+        phases = [event.phase for event in observed if isinstance(event, AgentActivity)]
+        assert phases[0] == "thinking"
+        assert phases[-1] == outcome
+        assert "completed" not in phases
+    finally:
+        unsubscribe()
+
+
+@pytest.mark.asyncio
+async def test_task_activity_publishes_to_application_observers_without_a_selected_session(system):
+    first, _second, server, _job = system
+    observed = []
+    unsubscribe = server.watch_activity(observed.append)
+    try:
+        await first.reply(
+            "task result",
+            job_tools=[],
+            activity_source="task",
+            activity_run_id="run",
+            activity_task_id="research",
+        )
+        assert observed[0].phase == "thinking" and observed[-1].phase == "completed"
+        assert all(item.source == "task" and item.run_id == "run" and item.task_id == "research" for item in observed)
+        assert len({item.session_id for item in observed}) == 1
+    finally:
+        unsubscribe()
