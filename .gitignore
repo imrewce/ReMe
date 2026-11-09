@@ -50,6 +50,8 @@ temp*/
 
 # ReMe runtime data
 .reme/
+# Agent skill symlinks created at runtime by _ensure_skills under project_path
+.agents/
 reme_workspace/
 reme_workspace_auto_fin_real_test*/
 vault/
